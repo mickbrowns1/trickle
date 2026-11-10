@@ -598,8 +598,9 @@ function renderInspector(){
       if(m.auth === "darktrace") h += mi("public_token", "Public token", "pub_test") + mi("private_token", "Private token", "priv_test");
       if(m.auth === "apikey") h += mi("key_header", "Header name", "x-api-key") + mi("key_value", "Key value", "test-key");
       if(m.auth === "bearer") h += mi("bearer_token", "Bearer token", "test-token");
-      h += field("Response shape", '<select data-mk="shape">' + opt("array","Top-level JSON array",m.shape) + opt("data","{ \"data\": [ ... ] }",m.shape) + opt("events","{ \"events\": [ ... ] }",m.shape) + opt("value","{ \"value\": [ ... ] } (Microsoft Graph)",m.shape) + opt("result","{ \"result\": [ ... ] } (Netskope)",m.shape) + '</select>');
-      h += field("Paging", '<select data-mk="paging">' + [["none","None: every call returns all records"],["link","Link header, rel=next (Okta)"],["search_after","X-Search_after header (JumpCloud)"],["cursor","next_cursor in the body"],["page","Page number (?page=2)"],["odata","@odata.nextLink with $skiptoken (Microsoft Graph)"],["offset","limit and offset (Netskope)"]].map((o) => opt(o[0], o[1], m.paging || "none")).join("") + '</select>',
+      h += field("Response shape", '<select data-mk="shape">' + opt("array","Top-level JSON array",m.shape) + opt("data","{ \"data\": [ ... ] }",m.shape) + opt("events","{ \"events\": [ ... ] }",m.shape) + opt("value","{ \"value\": [ ... ] } (Microsoft Graph)",m.shape) + opt("result","{ \"result\": [ ... ] } (Netskope)",m.shape) + opt("items","{ \"items\": [ ... ] } (1Password)",m.shape) + opt("template","Custom JSON envelope (template below)",m.shape) + '</select>');
+      if(m.shape === "template") h += field("Response template (JSON)", '<textarea data-mk="body_template" spellcheck="false" style="min-height:90px" placeholder="{&quot;queryEndTime&quot;: &quot;{{now_iso}}&quot;, &quot;events&quot;: &quot;{{records}}&quot;}">' + esc(m.body_template || "") + '</textarea>', "Tokens: &quot;{{records}}&quot; (all), &quot;{{records:0:2}}&quot; (a slice), {{now_iso}}, {{now_ms}}. Paging is not applied to templates.");
+      h += field("Paging", '<select data-mk="paging">' + [["none","None: every call returns all records"],["link","Link header, rel=next (Okta)"],["search_after","X-Search_after header (JumpCloud)"],["cursor","next_cursor in the body"],["page","Page number (?page=2)"],["odata","@odata.nextLink with $skiptoken (Microsoft Graph)"],["offset","limit and offset (Netskope)"],["graphql","GraphQL first/after, nodes and pageInfo (Wiz)"],["jsonapi","JSON:API links.next with starting_after (Snyk)"],["cursor_items","Cursor in the JSON body, has_more (1Password)"]].map((o) => opt(o[0], o[1], m.paging || "none")).join("") + '</select>',
         "The mock slices the records below into pages. The last page carries no next link, so bugs like building a URL from a nil next_url show up.");
       if(m.paging && m.paging !== "none"){
         h += mi("page_size", "Page size (records per call)", "2");
@@ -608,14 +609,17 @@ function renderInspector(){
       }
       h += field("Time windows", '<select data-mk="window_mode">' + opt("off","Off: ignore starttime/endtime",m.window_mode || "off") + opt("spread","Spread records across the requested window",m.window_mode || "off") + opt("filter","Filter records to the requested window",m.window_mode || "off") + '</select>',
         "For APIs that take a time range (starttime/endtime, start/end, from/to, since/until; seconds, milliseconds or ISO). Spread always lands records inside the window, so sample data never ages out.");
-      if(m.window_mode === "spread") h += field("Time format written to records", '<select data-mk="time_unit">' + opt("ms","Epoch milliseconds",m.time_unit || "ms") + opt("s","Epoch seconds",m.time_unit || "ms") + opt("iso","ISO 8601 (2026-11-10T08:00:00.000Z)",m.time_unit || "ms") + '</select>');
+      if(m.window_mode === "spread") h += field("Time format written to records", '<select data-mk="time_unit">' + opt("ms","Epoch milliseconds",m.time_unit || "ms") + opt("s","Epoch seconds",m.time_unit || "ms") + opt("iso","ISO 8601 (2026-11-10T08:00:00.000Z)",m.time_unit || "ms") + opt("iso_mixed","ISO 8601, alternating Z and +05:30",m.time_unit || "ms") + '</select>');
       if(m.window_mode && m.window_mode !== "off") h += mi("time_field", "Record time field", "time");
       h += field("Records the data endpoint returns", '<textarea data-mk="records" spellcheck="false" placeholder="Paste JSON events: one object, an array, or one per line" style="min-height:140px">' + esc(m.records || "") + '</textarea>',
         "Served in pages when paging is on, otherwise all on every call.");
-      h += field("Extra endpoints (optional JSON)", '<textarea data-mk="routes" spellcheck="false" placeholder="{&quot;/status&quot;: {&quot;version&quot;: &quot;6.1&quot;}, &quot;/groups&quot;: [{&quot;id&quot;: 1}]}" style="min-height:60px">' + esc(m.routes || "") + '</textarea>', "Path to reply. An array is served like the records above; an object is returned as is. A key like /events?type=policy answers only that query value. Any other path gets the records above.");
+      h += field("Inject a failure (optional)", '<select data-mk="fail_status">' + [["","None"],["429","HTTP 429"],["400","HTTP 400"],["401","HTTP 401"],["500","HTTP 500"],["gql","HTTP 200 with GraphQL errors and null data"]].map((o) => opt(o[0], o[1], m.fail_status || "")).join("") + '</select>',
+        "Answers one data call with this failure to exercise the script's error branches.");
+      if(m.fail_status) h += mi("fail_on_call", "On data call number", "1");
+      h += field("Extra endpoints (optional JSON)", '<textarea data-mk="routes" spellcheck="false" placeholder="{&quot;/status&quot;: {&quot;version&quot;: &quot;6.1&quot;}, &quot;/groups&quot;: [{&quot;id&quot;: 1}]}" style="min-height:60px">' + esc(m.routes || "") + '</textarea>', "Path to reply. An array is served like the records above; an object is returned as is. A key like /events?type=policy answers only that query value, and gql:issues answers a GraphQL query whose first field is issues. Any other path gets the records above.");
       h += field("Checkpoint keys", '<input type="text" data-k="chkpt_keys" placeholder="SINCE_DATE_TIME" value="' + esc(s.chkpt_keys || "") + '">', "Keys the host source registers. Using any other key raises NotFoundChkptId, like the real runtime.",
-        '<button class="btn small" data-action="presetOkta">Okta preset</button> <button class="btn small" data-action="presetDarktrace">Darktrace preset</button> <button class="btn small" data-action="presetEntra">Entra preset</button> <button class="btn small" data-action="presetNetskope">Netskope preset</button>');
-      h += field("Checkpoint starting values (optional JSON)", '<textarea data-k="chkpt_seed" spellcheck="false" placeholder="{&quot;initial_since&quot;: &quot;2026-11-01T00:00:00Z&quot;}" style="min-height:44px">' + esc(s.chkpt_seed || "") + '</textarea>', "What get_chkpt returns before the script sets anything. Values must be strings. {now_ms-2h} expands to epoch milliseconds two hours ago (units s, m, h, d), handy for testing catch-up.");
+        '<button class="btn small" data-action="presetOkta">Okta preset</button> <button class="btn small" data-action="presetDarktrace">Darktrace preset</button> <button class="btn small" data-action="presetEntra">Entra preset</button> <button class="btn small" data-action="presetNetskope">Netskope preset</button> <button class="btn small" data-action="presetWiz">Wiz preset</button> <button class="btn small" data-action="presetSnyk">Snyk preset</button> <button class="btn small" data-action="presetProofpoint">Proofpoint preset</button> <button class="btn small" data-action="presetOnePassword">1Password preset</button>');
+      h += field("Checkpoint starting values (optional JSON)", '<textarea data-k="chkpt_seed" spellcheck="false" placeholder="{&quot;initial_since&quot;: &quot;2026-11-01T00:00:00Z&quot;}" style="min-height:44px">' + esc(s.chkpt_seed || "") + '</textarea>', "What get_chkpt returns before the script sets anything. Values must be strings. {now_ms-2h}, {now_s-6h} and {now_iso-30m} expand to a time relative to the run (units s, m, h, d), handy for testing catch-up.");
       h += field("Config JSON (optional)", '<textarea data-k="config" spellcheck="false" placeholder="{}" style="min-height:60px">' + esc(s.config || "") + '</textarea>', "Passed to start(config), for example config[\"domain\"].");
       h += '<div class="insp-actions" style="margin:12px 0 4px"><button class="btn small primary" data-action="runCollector">Run collector</button> ' + clearBtn("clearSource") + '</div>';
       h += '<div class="hint">After a run, the emitted events become this pipeline source: press Generate on the serializer step to build the OCSF Lua from them.</div>';
@@ -1320,6 +1324,59 @@ document.addEventListener("click", async (ev) => {
       "/api/v2/events/data/alert?type=malware": [1, 2].map((i) => JSON.parse(ev("malware", i)))});
     last = null; renderAll();
     banner("ok", "Netskope preset applied: host-injected token, offset paging with API_LIMIT 2, policy and malware routes, per-type checkpoints (policy 6 hours behind to trigger the catch-up window). A full page means more, so policy takes three calls.");
+  }
+  else if(a === "presetWiz"){
+    const sx = pipe.source;
+    sx.chkpt_keys = "AUDIT_SINCE_TIME, ISSUES_SINCE_TIME, AUDIT_CURSOR, ISSUES_CURSOR";
+    sx.chkpt_seed = JSON.stringify({AUDIT_SINCE_TIME: "{now_iso-2d}", ISSUES_SINCE_TIME: "{now_iso-2d}"});
+    sx.config = JSON.stringify({WIZ_API_URL: "https://api.us1.app.wiz.io/graphql", MAX_PAGE_CALLS: 5, COLLECT_AUDIT_LOGS: true, COLLECT_ISSUES: true}, null, 2);
+    const m = sx.mock || (sx.mock = {});
+    m.auth = "host"; m.paging = "graphql"; m.page_size = "2"; m.shape = "data"; m.window_mode = "spread"; m.time_field = "timestamp, createdAt"; m.time_unit = "iso"; m.fail_status = ""; m.body_template = "";
+    m.records = [1, 2, 3].map((i) => JSON.stringify({id: "audit-" + i, action: "Login", status: "SUCCESS", timestamp: "", user: {id: "u" + i, name: "User " + i, email: "user" + i + "@example.com"}, sourceIP: "198.51.100." + i})).join("\n");
+    m.routes = JSON.stringify({"gql:issues": [1, 2, 3, 4, 5].map((i) => ({id: "issue-" + i, type: "TOXIC_COMBINATION", severity: "HIGH", status: "OPEN", createdAt: "", sourceRule: {name: "Rule " + i}, entitySnapshot: {id: "ent-" + i, name: "vm-" + i, type: "VIRTUAL_MACHINE"}}))});
+    last = null; renderAll();
+    banner("ok", "Wiz preset applied: host-injected OAuth, GraphQL paging (2 per page), audit entries and issues as separate roots, checkpoints seeded 2 days back.");
+  }
+  else if(a === "presetSnyk"){
+    const sx = pipe.source;
+    sx.chkpt_keys = "ISSUES_SINCE_TIME, NEXT_PAGE";
+    sx.chkpt_seed = "";
+    sx.config = JSON.stringify({SNYK_API_BASE: "https://api.snyk.io", SNYK_API_VERSION: "2024-10-15", SNYK_LIMIT: 2, SNYK_ENTITY_TYPE: "org", SNYK_ENTITY_ID: "org-123", MAX_PAGE_CALLS: 5}, null, 2);
+    const m = sx.mock || (sx.mock = {});
+    m.auth = "host"; m.paging = "jsonapi"; m.page_size = ""; m.shape = "data"; m.window_mode = "spread"; m.time_field = "attributes.created_at"; m.time_unit = "iso"; m.routes = ""; m.fail_status = ""; m.body_template = "";
+    m.records = [1, 2, 3, 4, 5].map((i) => JSON.stringify({id: "issue-" + i, type: "issue", attributes: {title: "Vulnerability " + i, effective_severity_level: "high", status: "open", created_at: ""}})).join("\n");
+    last = null; renderAll();
+    banner("ok", "Snyk preset applied: host-injected token, JSON:API links.next paging (limit 2), created_after window, checkpoint keys ISSUES_SINCE_TIME and NEXT_PAGE.");
+  }
+  else if(a === "presetProofpoint"){
+    const sx = pipe.source;
+    sx.chkpt_keys = "SINCE_TIME";
+    sx.chkpt_seed = JSON.stringify({SINCE_TIME: "{now_iso-30m}"});
+    sx.config = JSON.stringify({PROOFPOINT_URL: "https://tap-api-v2.proofpoint.com/v2/siem/all"}, null, 2);
+    const m = sx.mock || (sx.mock = {});
+    m.auth = "host"; m.paging = "none"; m.page_size = ""; m.shape = "template"; m.window_mode = "spread"; m.time_field = "messageTime, clickTime"; m.time_unit = "iso"; m.routes = ""; m.fail_status = "";
+    m.body_template = JSON.stringify({queryEndTime: "{{now_iso}}", messagesDelivered: "{{records:0:2}}", messagesBlocked: "{{records:2:3}}", clicksPermitted: [], clicksBlocked: "{{records:3:4}}"}, null, 2);
+    m.records = [JSON.stringify({GUID: "m1", messageTime: "", sender: "a@evil.example", recipient: ["u1@example.com"], subject: "Invoice", replyToAddress: null}),
+      JSON.stringify({GUID: "m2", messageTime: "", sender: "b@evil.example", recipient: ["u2@example.com"], subject: "Reset", replyToAddress: null}),
+      JSON.stringify({GUID: "m3", messageTime: "", sender: "c@evil.example", recipient: ["u3@example.com"], subject: "Prize", replyToAddress: null}),
+      JSON.stringify({GUID: "c1", clickTime: "", url: "http://bad.example/x", recipient: "u4@example.com", classification: "phish"})].join("\n");
+    last = null; renderAll();
+    banner("ok", "Proofpoint preset applied: host-injected Basic auth, response template with four event arrays and queryEndTime, SINCE_TIME seeded 30 minutes back. Use Inject a failure with 500 or 400 to see the checkpoint jump.");
+  }
+  else if(a === "presetOnePassword"){
+    const sx = pipe.source;
+    const names = ["SIGNINATTEMPTS", "ITEMUSAGES", "AUDITEVENTS"], suff = ["SINCE_TIME", "UNTIL_TIME", "PAGE", "MAX_EVENT_TIME", "RUNNING"];
+    sx.chkpt_keys = names.map((n) => suff.map((x) => n + "_" + x).join(", ")).join(", ");
+    sx.chkpt_seed = "";
+    sx.config = JSON.stringify({ONEPASSWORD_API_BASE: "https://events.1password.com", PAGE_LIMIT: 2, MAX_PAGE_CALLS: 5, LOOK_BACK_HOURS: 24}, null, 2);
+    const m = sx.mock || (sx.mock = {});
+    m.auth = "host"; m.paging = "cursor_items"; m.page_size = ""; m.shape = "items"; m.window_mode = "spread"; m.time_field = "timestamp"; m.time_unit = "iso_mixed"; m.fail_status = ""; m.body_template = "";
+    const ev = (t, i) => ({uuid: t + "-" + i, timestamp: "", action: "example", session_uuid: "s" + i});
+    m.records = "";
+    m.routes = JSON.stringify({"/api/v2/signinattempts": [1, 2, 3, 4, 5].map((i) => ({uuid: "sia-" + i, timestamp: "", category: "success", type: "credentials_ok", target_user: {email: "user" + i + "@example.com"}})),
+      "/api/v2/itemusages": [1, 2, 3].map((i) => ev("iu", i)), "/api/v2/auditevents": [1, 2].map((i) => ev("ae", i))});
+    last = null; renderAll();
+    banner("ok", "1Password preset applied: host-injected JWT, cursor-in-body paging (2 per page), three streams with their own routes, timestamps alternating Z and +05:30, all 15 per-stream checkpoint keys (including the RUNNING locks).");
   }
   else if(a === "starterCollector"){ pipe.source.code = starterCollector(pipe.source.mock); last = null; renderAll(); }
   else if(a === "runCollector"){ await runCollectorUI(); }

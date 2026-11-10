@@ -4,7 +4,9 @@ Auth modes: none, darktrace (self-signed HMAC-SHA1 DTAPI headers), host (the DPM
 oauth2_basic (client_secret_basic), oauth2_post (client_secret_post).
 Paging styles: none, link (Link: rel="next" header, Okta style), search_after (X-Search_after header, JumpCloud style),
 cursor (next_cursor in the body), page (page number), odata (@odata.nextLink with $skiptoken, Microsoft Graph),
-offset (limit and offset query parameters, Netskope).
+offset (limit and offset query parameters, Netskope), graphql (first/after in the query text, nodes and pageInfo, Wiz),
+jsonapi (links.next relative path with starting_after, Snyk), cursor_items (cursor in the JSON body, items/cursor/has_more, 1Password).
+Shape "template" returns a JSON envelope with {{records}}, {{records:0:2}}, {{now_iso}} and {{now_ms}} tokens (Proofpoint).
 Any URL whose last path segment is "token" (or ends with /token) is the token endpoint for the OAuth2 modes;
 every other URL is the data endpoint. The data endpoint serves the pasted records in one response.
 """
@@ -14,12 +16,14 @@ import hmac
 import json
 import re
 import secrets
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 AUTH_MODES = ("none", "host", "darktrace", "basic", "apikey", "bearer", "oauth2_basic", "oauth2_post")
-PAGING = ("none", "link", "search_after", "cursor", "page", "odata", "offset")
-SHAPES = ("array", "data", "events", "value", "result")
+PAGING = ("none", "link", "search_after", "cursor", "page", "odata", "offset", "graphql", "jsonapi", "cursor_items")
+SHAPES = ("array", "data", "events", "value", "result", "items", "template")
+SINGLE_START = ("sinceTime", "created_after", "start_time", "since", "starttime", "from", "after")
 LIMIT_KEYS = ("$top", "limit", "per_page", "page_size", "pageSize", "maxResults", "max_results")
 TIME_PAIRS = (("starttime", "endtime"), ("insertionstarttime", "insertionendtime"), ("start", "end"), ("from", "to"), ("since", "until"), ("start_time", "end_time"))
 CURSOR_KEYS = ("cursor", "next", "page_token", "after_cursor", "starting_after")
@@ -79,6 +83,7 @@ def _mask(headers):
 class MockApi:
     def __init__(self, cfg, records):
         cfg = cfg or {}
+        self.config_error = None
         self.mode = cfg.get("auth") if cfg.get("auth") in AUTH_MODES else "none"
         self.client_id = str(cfg.get("client_id") or "")
         self.client_secret = str(cfg.get("client_secret") or "")
@@ -86,7 +91,22 @@ class MockApi:
         self.key_value = str(cfg.get("key_value") or "")
         self.bearer_token = str(cfg.get("bearer_token") or "")
         self.shape = cfg.get("shape") if cfg.get("shape") in SHAPES else "array"
-        self.time_unit = cfg.get("time_unit") if cfg.get("time_unit") in ("ms", "s", "iso") else "ms"
+        self.time_unit = cfg.get("time_unit") if cfg.get("time_unit") in ("ms", "s", "iso", "iso_mixed") else "ms"
+        self.fail_status = str(cfg.get("fail_status") or "").strip()
+        try:
+            self.fail_on = int(cfg.get("fail_on_call") or 0)
+        except (TypeError, ValueError):
+            self.fail_on = 0
+        self.data_n = 0
+        self.windows = {}
+        self.template = None
+        tt = str(cfg.get("body_template") or "").strip()
+        if self.shape == "template":
+            try:
+                self.template = json.loads(tt) if tt else {"records": "{{records}}"}
+            except ValueError:
+                self.template = None
+                self.config_error = "The response template must be valid JSON, for example {\"events\": \"{{records}}\", \"queryEndTime\": \"{{now_iso}}\"}."
         try:
             self.ttl = int(cfg.get("token_ttl") or 3600)
         except (TypeError, ValueError):
@@ -101,8 +121,8 @@ class MockApi:
         self.public_token = str(cfg.get("public_token") or "")
         self.private_token = str(cfg.get("private_token") or "")
         self.time_field = str(cfg.get("time_field") or "").strip()
+        self.time_fields = [f.strip() for f in self.time_field.split(",") if f.strip()]
         self.window_mode = cfg.get("window_mode") if cfg.get("window_mode") in ("filter", "spread") else "off"
-        self.config_error = None
         self.routes = {}
         rt = str(cfg.get("routes") or "").strip()
         if rt:
@@ -224,7 +244,19 @@ class MockApi:
             hdrs = {"WWW-Authenticate": "Bearer"}
         if not ok:
             return self._resp(401, {"error": "unauthorized", "message": why}, why, req, hdrs, auth_ok=False)
+        self.data_n += 1
+        if self.fail_on and self.fail_status and self.data_n == self.fail_on:
+            if self.fail_status.lower() == "gql":
+                return self._resp(200, {"errors": [{"message": "injected GraphQL error"}], "data": None},
+                                  "injected: HTTP 200 with a GraphQL errors body and null data (data call %d)" % self.data_n, req, auth_ok=True)
+            try:
+                code = int(self.fail_status)
+            except ValueError:
+                code = 500
+            return self._resp(code, {"error": "injected failure"}, "injected: HTTP %d on data call %d" % (code, self.data_n), req, auth_ok=True)
         recs, obj, tnote = self._records_for(req)
+        if self.shape == "template" and obj is None and self.template is not None:
+            return self._resp(200, self._render(self.template, recs), why + tnote + "; template reply", req, auth_ok=True, warn=warn)
         if obj is not None:
             return self._resp(200, obj, why + "; single object reply" + tnote, req, auth_ok=True, warn=warn)
         body, extra, pnote = self._page(req, recs)
@@ -279,60 +311,174 @@ class MockApi:
         except ValueError:
             return None
 
+    def _render(self, node, recs):
+        if isinstance(node, str):
+            m = re.fullmatch(r"\{\{records(?::(\d*):(\d*))?\}\}", node)
+            if m:
+                if m.group(1) is None:
+                    return list(recs)
+                return list(recs)[int(m.group(1) or 0):(int(m.group(2)) if m.group(2) else None)]
+            now = datetime.now(timezone.utc)
+            return node.replace("{{now_iso}}", now.strftime("%Y-%m-%dT%H:%M:%SZ")).replace("{{now_ms}}", str(int(now.timestamp() * 1000)))
+        if isinstance(node, list):
+            return [self._render(x, recs) for x in node]
+        if isinstance(node, dict):
+            return {k: self._render(v, recs) for k, v in node.items()}
+        return node
+
+    @staticmethod
+    def _jbody(req):
+        try:
+            v = json.loads(req["body"]) if req["body"] else {}
+        except ValueError:
+            return {}
+        return v if isinstance(v, dict) else {}
+
+    @staticmethod
+    def _gql_root(jb):
+        m = re.search(r"\{\s*(\w+)\s*[({]", str(jb.get("query", "")))
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _get(rec, path):
+        cur = rec
+        for p in path.split("."):
+            if isinstance(cur, dict) and p in cur:
+                cur = cur[p]
+            else:
+                return None
+        return cur
+
+    @staticmethod
+    def _set(rec, path, val):
+        parts = path.split(".")
+        cur = rec
+        for p in parts[:-1]:
+            if not isinstance(cur.get(p), dict):
+                cur[p] = {}
+            cur = cur[p]
+        cur[parts[-1]] = val
+
+    def _fmt(self, t, i):
+        if self.time_unit == "ms":
+            return t
+        if self.time_unit == "s":
+            return t // 1000
+        dt = datetime.fromtimestamp(t / 1000, timezone.utc)
+        if self.time_unit == "iso_mixed" and i % 2:
+            return dt.astimezone(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%dT%H:%M:%S") + "+05:30"
+        if self.time_unit == "iso_mixed":
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    def _window(self, req, qp, jb):
+        src = {k: v for k, v in qp}
+        for k, v in jb.items():
+            if isinstance(v, (str, int, float)) and not isinstance(v, bool):
+                src.setdefault(k, v)
+        for a, b in TIME_PAIRS:
+            if a in src and b in src:
+                return self._ms(src[a]), self._ms(src[b])
+        fm = re.search(r"\bge\s+(\S+)\s+and\s+\w+\s+le\s+(\S+)", str(src.get("$filter", "")))
+        if fm:
+            return self._ms(fm.group(1)), self._ms(fm.group(2))
+        now = int(time.time() * 1000)
+        for k in SINGLE_START:
+            if k in src:
+                lo = self._ms(src[k])
+                if lo is not None:
+                    return lo, now
+        m = re.search(r"\{\s*after:\s*\"([^\"]+)\"", str(jb.get("query", "")))
+        if m:
+            lo = self._ms(m.group(1))
+            if lo is not None:
+                return lo, now
+        return None, None
+
     def _records_for(self, req):
         u = urlparse(req["url"])
         path = "/" + u.path.strip("/")
-        recs, note = self.records, ""
         qp = parse_qsl(u.query, keep_blank_values=True)
-        rkey = next((path + "?" + k + "=" + v for k, v in qp if (path + "?" + k + "=" + v) in self.routes), path)
+        jb = self._jbody(req)
+        keys = []
+        if self.paging == "graphql" and self._gql_root(jb):
+            keys.append("gql:" + self._gql_root(jb))
+        keys += [path + "?" + k + "=" + v for k, v in qp]
+        keys.append(path)
+        rkey = next((k for k in keys if k in self.routes), path)
+        recs, note = self.records, ""
         if rkey in self.routes:
             val = self.routes[rkey]
             if not isinstance(val, list):
                 return [], val, ""
             recs, note = val, "; route " + rkey
-        if self.window_mode == "off" or not self.time_field:
+        if self.window_mode == "off" or not self.time_fields:
             return recs, None, note
-        q = {k: v for k, v in parse_qsl(u.query, keep_blank_values=True)}
-        for a, b in TIME_PAIRS:
-            if a in q and b in q:
-                lo, hi = self._ms(q[a]), self._ms(q[b])
-                if lo is None or hi is None:
-                    return recs, None, note
-                break
-        else:
-            fm = re.search(r"\bge\s+(\S+)\s+and\s+\w+\s+le\s+(\S+)", q.get("$filter", ""))
-            lo, hi = (self._ms(fm.group(1)), self._ms(fm.group(2))) if fm else (None, None)
-            if lo is None or hi is None:
+        lo, hi = self._window(req, qp, jb)
+        if lo is None or hi is None:
+            if rkey in self.windows:
+                lo, hi = self.windows[rkey]
+                note += "; reusing the window from the first call"
+            else:
                 return recs, None, note + "; no time window in the request"
+        else:
+            self.windows[rkey] = (lo, hi)
         if self.window_mode == "spread":
             n = len(recs)
             out = []
             for i, rec in enumerate(recs):
-                c = dict(rec) if isinstance(rec, dict) else rec
+                c = json.loads(json.dumps(rec)) if isinstance(rec, dict) else rec
                 if isinstance(c, dict):
-                    t = lo + (hi - lo) * (i + 1) // (n + 1)
-                    c[self.time_field] = (t if self.time_unit == "ms" else t // 1000 if self.time_unit == "s" else
-                                          datetime.fromtimestamp(t / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+                    t = self._fmt(lo + (hi - lo) * (i + 1) // (n + 1), i)
+                    present = [f for f in self.time_fields if self._get(c, f) is not None]
+                    for f in (present or self.time_fields[:1]):
+                        self._set(c, f, t)
                 out.append(c)
-            return out, None, note + "; %d record(s) spread across the requested window %d-%d" % (n, lo, hi)
+            return out, None, note + "; %d record(s) spread across the window %d-%d" % (n, lo, hi)
         out = []
         for rec in recs:
-            t = self._ms(rec.get(self.time_field)) if isinstance(rec, dict) else None
+            t = None
+            if isinstance(rec, dict):
+                for f in self.time_fields:
+                    if self._get(rec, f) is not None:
+                        t = self._ms(self._get(rec, f))
+                        break
             if t is not None and lo <= t <= hi:
                 out.append(rec)
         return out, None, note + "; window %d-%d kept %d of %d" % (lo, hi, len(out), len(recs))
 
-    # -- paging -----------------------------------------------------------
+    def _gql_page(self, req, recs):
+        jb = self._jbody(req)
+        qtext = str(jb.get("query", ""))
+        root = self._gql_root(jb) or "items"
+        stripped = re.sub(r"filterBy:\s*\{[^{}]*\{[^{}]*\}\s*\}", "", qtext)
+        m = re.search(r"\bafter:\s*\"([^\"]*)\"", stripped)
+        cursor = m.group(1) if m else ""
+        fm = re.search(r"\bfirst:\s*(\d+)", qtext)
+        first = int(fm.group(1)) if fm else 100
+        limit = min(first, self.page_size) if self.page_size else first
+        total = len(recs)
+        try:
+            start = max(0, int(cursor.split("-")[-1])) if cursor else 0
+        except ValueError:
+            start = 0
+        end = min(total, start + max(1, limit))
+        body = {"data": {root: {"nodes": recs[start:end], "pageInfo": {"hasNextPage": end < total, "endCursor": "gc-%d" % end}}}}
+        note = "; %s records %d-%d of %d, hasNextPage %s" % (root, start + 1 if end > start else start, end, total, str(end < total).lower())
+        return body, {}, note
+
     def _wrap(self, recs, more=None):
         if self.shape == "array" and more is None:
             return recs
-        key = self.shape if self.shape in ("events", "value", "result") else "data"
+        key = self.shape if self.shape in ("events", "value", "result", "items") else "data"
         out = {key: recs}
         out.update(more or {})
         return out
 
     def _page(self, req, recs):
         total = len(recs)
+        if self.paging == "graphql":
+            return self._gql_page(req, recs)
         if self.paging == "none":
             return self._wrap(recs), {}, ""
         u = urlparse(req["url"])
@@ -392,6 +538,21 @@ class MockApi:
                 nxt += ("&" if "?" in nxt else "?") + "$skiptoken=st-%d" % end
                 wrapper["@odata.nextLink"] = nxt
             note = "; records %d-%d of %d, %s" % (start + 1 if end > start else start, end, total, "has @odata.nextLink" if wrapper else "no @odata.nextLink (last page)")
+        elif self.paging == "jsonapi":
+            start = idx(q.get("starting_after"))
+            end = min(total, start + limit)
+            wrapper = {"jsonapi": {"version": "1.0"}}
+            if end < total:
+                rel = u.path + ("?" + u.query if u.query else "")
+                rel = re.sub(r"[?&]starting_after=[^&]*", "", rel)
+                wrapper["links"] = {"next": rel + ("&" if "?" in rel else "?") + "starting_after=jc-%d" % end}
+            note = "; records %d-%d of %d, %s" % (start + 1 if end > start else start, end, total, "links.next present" if "links" in wrapper else "no links.next (last page)")
+        elif self.paging == "cursor_items":
+            cur = jb.get("cursor") or q.get("cursor")
+            start = idx(cur) if cur else 0
+            end = min(total, start + limit)
+            wrapper = {"cursor": "oc-%d" % end, "has_more": end < total}
+            note = "; %s, records %d-%d of %d, has_more %s" % ("cursor given" if cur else "no cursor", start + 1 if end > start else start, end, total, str(end < total).lower())
         elif self.paging == "offset":
             start = idx(q.get("offset") or jb.get("offset"))
             end = min(total, start + limit)

@@ -1405,8 +1405,10 @@ def run_collector(src):
             if m.group(2):
                 delta = (1 if m.group(2) == "+" else -1) * int(m.group(3)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(4) or "s"]
             t = now + delta
+            if m.group(1) == "iso":
+                return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
             return str(int(t * 1000)) if m.group(1) == "ms" else str(int(t))
-        return re.sub(r"\{now_(ms|s)(?:([+-])(\d+)([smhd])?)?\}", sub, v)
+        return re.sub(r"\{now_(ms|s|iso)(?:([+-])(\d+)([smhd])?)?\}", sub, v)
     seed = {k: _seed_val(v) for k, v in seed.items() if isinstance(v, str)}
     run_dir = Path(tempfile.mkdtemp(prefix="pipelab_col_"))
     out = {"ok": True, "records": [], "transcript": api.transcript, "logs": [], "errors": [], "printed": [], "requests": 0}
