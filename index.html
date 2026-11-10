@@ -433,7 +433,7 @@ let tab = "events";
 let stageSel = 0;
 let menuAt = null;             // link index with open "add" menu
 let cfgText = null;
-let SETTINGS = {detection_coverage: false, busted_button: true, gap_generation: false};
+let SETTINGS = {detection_coverage: false, busted_button: true, gap_generation: false, collector_testing: false};
 let DETFILE = false;
 let ENV = {};                  // /api/status, so hints can match how the app is running
 const pathHint = () => ENV.docker ? " Running in Docker: put the file in the <code>data</code> folder next to docker-compose.yml and use <code>/data/yourfile</code>." : "";
@@ -568,7 +568,7 @@ function renderInspector(){
   if(sel === "source"){
     $("inspTitle").textContent = "Source";
     const s = pipe.source;
-    h += field("Type", '<select data-k="type" data-struct="1">' + opt("record","Paste a record (Auto Detect format)",s.type) + opt("collector","Collector Lua + mock API (test auth)",s.type) + opt("generator","Sample log generator",s.type) + opt("file","File (paste or path)",s.type) + opt("http","HTTP listener",s.type) + '</select>');
+    h += field("Type", '<select data-k="type" data-struct="1">' + opt("record","Paste a record (Auto Detect format)",s.type) + (SETTINGS.collector_testing || s.type === "collector" ? opt("collector","Collector Lua + mock API (test auth)",s.type) : "") + opt("generator","Sample log generator",s.type) + opt("file","File (paste or path)",s.type) + opt("http","HTTP listener",s.type) + '</select>');
     if(s.type === "record"){
       h += '<label class="setrow" style="border-bottom:0;padding:4px 0 8px"><input type="checkbox" data-multi="1"' + (s.multi ? " checked" : "") + '><span><b>Multiple log types</b> <span class="muted">(one stream with different event types, like Cloudflare)</span></span></label>';
     }
@@ -590,7 +590,7 @@ function renderInspector(){
       const mi = (k, label, ph) => field(label, '<input type="text" data-mk="' + k + '" spellcheck="false" placeholder="' + esc(ph || "") + '" value="' + esc(m[k] == null ? "" : m[k]) + '">');
       h += field("Collector Lua", '<textarea data-k="code" spellcheck="false" placeholder="Paste a DPM collector: start(config), fetch { ... }, emit { log = event }" style="min-height:220px">' + esc(s.code) + '</textarea>',
         "Runs with fetch, emit, get_chkpt and set_chkpt like the DPM runtime. Requests go to the mock API below, not the internet.",
-        '<button class="btn small" data-action="starterCollector">Insert starter collector</button>');
+        '<button class="btn small" data-action="starterCollector">Insert starter for this auth type</button>');
       h += '<h3 style="margin:14px 0 4px">Mock API</h3>';
       h += field("Authentication", '<select data-mk="auth">' + [["none","None"],["basic","Basic (id:secret)"],["apikey","API key header"],["bearer","Static Bearer token"],["oauth2_basic","OAuth2 client credentials: client_secret_basic"],["oauth2_post","OAuth2 client credentials: client_secret_post"]].map((o) => opt(o[0], o[1], m.auth || "none")).join("") + '</select>',
         m.auth && m.auth.indexOf("oauth2") === 0 ? "Any URL ending in /token is the token endpoint; every other URL is the data endpoint and needs the issued Bearer token." : "");
@@ -978,6 +978,7 @@ function renderSettings(){
   h += row("busted_button", "Run Busted button", "Shows the Run Busted buttons that check a Lua serializer.", SETTINGS.busted_button);
   h += row("detection_coverage", "Detection coverage", "After a serializer run, checks that the fields your detections use exist in the OCSF output, matched by dataSource.name. Off by default.", SETTINGS.detection_coverage);
   h += row("gap_generation", "Detection-aware Generate", "When you press Generate, also map the fields your detections look for, using source fields in the sample whose values match what the rules compare against. Needs the detection file below and a vendor/product that matches a dataSource.name. Off by default.", SETTINGS.gap_generation);
+  h += row("collector_testing", "Collector testing (mock API)", "Adds a Collector source: paste a DPM collector Lua and test its authentication (Basic, API key, Bearer, OAuth2) against a built-in fake API, then feed the events it emits into the serializer. Most data sources do not need this, so it is off by default.", SETTINGS.collector_testing);
   h += '<h3>Lua serializers</h3><p class="muted" style="margin-top:0">' + LUALIB.length + ' found: one per saved pipeline that has a Lua step, plus the bundled example. The zip holds only your pipelines.</p>'
      + '<p><a class="btn small" href="/api/lua.zip" download="trickle-lua.zip" style="text-decoration:none">Download all Lua (.zip)</a></p>';
   h += '<h3>Detection coverage: how to enable</h3>';
@@ -1071,76 +1072,55 @@ function diffHTML(before, after){
   });
   return {html: h || '<div class="muted">No change.</div>', add: add, del: del};
 }
-const STARTER_COLLECTOR = `local json = require('json')
-local log = require('log')
-
--- Edit these to match the vendor API. The mock API in Trickle checks them.
-local CLIENT_ID = "sa_test"
-local CLIENT_SECRET = "s3cret"
-local TOKEN_URL = "https://auth.example.com/oauth2/token"
-local EVENTS_URL = "https://api.example.com/v1/events"
-
-local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-local function base64(data)
-    local out = {}
-    local bytes = { data:byte(1, #data) }
-    local i = 1
-    while i <= #bytes do
-        local b1, b2, b3 = bytes[i], bytes[i + 1], bytes[i + 2]
-        local n = b1 * 65536 + (b2 or 0) * 256 + (b3 or 0)
-        local c1 = math.floor(n / 262144) % 64
-        local c2 = math.floor(n / 4096) % 64
-        local c3 = math.floor(n / 64) % 64
-        local c4 = n % 64
-        out[#out + 1] = B64:sub(c1 + 1, c1 + 1)
-        out[#out + 1] = B64:sub(c2 + 1, c2 + 1)
-        out[#out + 1] = b2 and B64:sub(c3 + 1, c3 + 1) or "="
-        out[#out + 1] = b3 and B64:sub(c4 + 1, c4 + 1) or "="
-        i = i + 3
-    end
-    return table.concat(out)
-end
-
-function start(config)
-    local basic = base64(CLIENT_ID .. ":" .. CLIENT_SECRET)
-    fetch {
-        params = {
-            url = TOKEN_URL,
-            method = "POST",
-            headers = { ["Content-Type"] = "application/x-www-form-urlencoded", ["Authorization"] = "Basic " .. basic },
-            body = "grant_type=client_credentials"
-        },
-        fn = "on_token",
-        retry = true,
-        context = {}
-    }
-end
-
-function on_token(config, response, context)
-    if response.status ~= 200 then
-        log.error("token call failed: " .. tostring(response.status) .. " " .. tostring(response.body))
-        return
-    end
-    local data = json.decode(response.body)
-    fetch {
-        params = { url = EVENTS_URL, method = "GET", headers = { ["Authorization"] = "Bearer " .. data.access_token } },
-        fn = "on_events",
-        retry = true,
-        context = {}
-    }
-end
-
-function on_events(config, response, context)
-    if response.status ~= 200 then
-        log.error("events call failed: " .. tostring(response.status) .. " " .. tostring(response.body))
-        return
-    end
-    local events = json.decode(response.body)
-    for _, ev in ipairs(events) do
-        emit { log = ev }
-    end
-end
-`;
+function starterCollector(m){
+  m = m || {};
+  const auth = m.auth || "none";
+  const L = [];
+  L.push("local json = require('json')", "local log = require('log')", "",
+    "-- Edit these to match the vendor API. The mock API in Trickle checks them.");
+  if(auth === "basic" || auth.indexOf("oauth2") === 0) L.push('local CLIENT_ID = "' + (m.client_id || "sa_test") + '"', 'local CLIENT_SECRET = "' + (m.client_secret || "s3cret") + '"');
+  if(auth === "apikey") L.push('local KEY_HEADER = "' + (m.key_header || "x-api-key") + '"', 'local KEY_VALUE = "' + (m.key_value || "test-key") + '"');
+  if(auth === "bearer") L.push('local BEARER_TOKEN = "' + (m.bearer_token || "test-token") + '"');
+  if(auth.indexOf("oauth2") === 0) L.push('local TOKEN_URL = "https://auth.example.com/oauth2/token"');
+  L.push('local EVENTS_URL = "https://api.example.com/v1/events"', "");
+  if(auth === "basic" || auth === "oauth2_basic") L.push(
+    'local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"',
+    "local function base64(data)", "    local out = {}", "    local bytes = { data:byte(1, #data) }", "    local i = 1",
+    "    while i <= #bytes do", "        local b1, b2, b3 = bytes[i], bytes[i + 1], bytes[i + 2]",
+    "        local n = b1 * 65536 + (b2 or 0) * 256 + (b3 or 0)",
+    "        local c1 = math.floor(n / 262144) % 64", "        local c2 = math.floor(n / 4096) % 64",
+    "        local c3 = math.floor(n / 64) % 64", "        local c4 = n % 64",
+    "        out[#out + 1] = B64:sub(c1 + 1, c1 + 1)", "        out[#out + 1] = B64:sub(c2 + 1, c2 + 1)",
+    '        out[#out + 1] = b2 and B64:sub(c3 + 1, c3 + 1) or "="', '        out[#out + 1] = b3 and B64:sub(c4 + 1, c4 + 1) or "="',
+    "        i = i + 3", "    end", "    return table.concat(out)", "end", "");
+  const get = (hdr) => ["        params = { url = EVENTS_URL, method = \"GET\", headers = { " + hdr + " } },",
+    '        fn = "on_events",', "        retry = true,", "        context = {}"];
+  L.push("function start(config)");
+  if(auth === "none"){ L.push("    fetch {", ...get('["Accept"] = "application/json"'), "    }"); }
+  else if(auth === "basic"){ L.push('    local basic = base64(CLIENT_ID .. ":" .. CLIENT_SECRET)', "    fetch {", ...get('["Authorization"] = "Basic " .. basic'), "    }"); }
+  else if(auth === "apikey"){ L.push("    fetch {", ...get('[KEY_HEADER] = KEY_VALUE'), "    }"); }
+  else if(auth === "bearer"){ L.push("    fetch {", ...get('["Authorization"] = "Bearer " .. BEARER_TOKEN'), "    }"); }
+  else {
+    const basic = auth === "oauth2_basic";
+    if(basic) L.push('    local basic = base64(CLIENT_ID .. ":" .. CLIENT_SECRET)');
+    L.push("    fetch {", "        params = {", "            url = TOKEN_URL,", '            method = "POST",',
+      "            headers = { " + (basic ? '["Content-Type"] = "application/x-www-form-urlencoded", ["Authorization"] = "Basic " .. basic' : '["Content-Type"] = "application/x-www-form-urlencoded"') + " },",
+      "            body = " + (basic ? '"grant_type=client_credentials"' : '"grant_type=client_credentials&client_id=" .. CLIENT_ID .. "&client_secret=" .. CLIENT_SECRET') + "",
+      "        },", '        fn = "on_token",', "        retry = true,", "        context = {}", "    }");
+  }
+  L.push("end", "");
+  if(auth.indexOf("oauth2") === 0) L.push("function on_token(config, response, context)", "    if response.status ~= 200 then",
+    '        log.error("token call failed: " .. tostring(response.status) .. " " .. tostring(response.body))', "        return", "    end",
+    "    local data = json.decode(response.body)", "    fetch {",
+    "        params = { url = EVENTS_URL, method = \"GET\", headers = { [\"Authorization\"] = \"Bearer \" .. data.access_token } },",
+    '        fn = "on_events",', "        retry = true,", "        context = {}", "    }", "end", "");
+  L.push("function on_events(config, response, context)", "    if response.status ~= 200 then",
+    '        log.error("events call failed: " .. tostring(response.status) .. " " .. tostring(response.body))', "        return", "    end",
+    "    local events = json.decode(response.body)",
+    "    if events.data then events = events.data elseif events.events then events = events.events end",
+    "    for _, ev in ipairs(events) do", "        emit { log = ev }", "    end", "end", "");
+  return L.join("\n");
+}
 async function runCollectorUI(){
   const s = pipe.source;
   banner("ok", "Running the collector against the mock API&hellip;");
@@ -1271,7 +1251,7 @@ document.addEventListener("click", async (ev) => {
   else if(a === "diffClose"){ pendingLua = null; $("diffModal").hidden = true; }
   else if(a === "theme"){ toggleTheme(); renderSettings(); }
   else if(a === "busted"){ await runBustedUI(); }
-  else if(a === "starterCollector"){ pipe.source.code = STARTER_COLLECTOR; last = null; renderAll(); }
+  else if(a === "starterCollector"){ pipe.source.code = starterCollector(pipe.source.mock); last = null; renderAll(); }
   else if(a === "runCollector"){ await runCollectorUI(); }
   else if(a === "bustedfix"){
     await proposeLua("/api/fixlua", {source: el.dataset.id, target: "busted"}, "Fix: " + el.dataset.note,

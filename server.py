@@ -2303,7 +2303,7 @@ def pipeline_path(name):
 # Settings and detection coverage (off by default)
 # ---------------------------------------------------------------------------
 
-SETTINGS_DEFAULTS = {"detection_coverage": False, "busted_button": True, "gap_generation": False}
+SETTINGS_DEFAULTS = {"detection_coverage": False, "busted_button": True, "gap_generation": False, "collector_testing": False}
 MAX_DETECTION_BYTES = 100 * 1024 * 1024
 _DET_CACHE = {}
 
