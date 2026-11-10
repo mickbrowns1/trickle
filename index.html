@@ -404,6 +404,7 @@ function newTransform(type){
 }
 function newSource(type){
   if(type === "record") return {type, text: CATO_SAMPLE};
+  if(type === "collector") return {type, code:"", config:"", chkpt_keys:"SINCE_DATE_TIME", text:"", mock:{auth:"oauth2_basic", client_id:"sa_test", client_secret:"s3cret", key_header:"x-api-key", key_value:"test-key", bearer_token:"test-token", shape:"array", token_ttl:3600, records:""}};
   if(type === "generator") return {type, format:"syslog", count:1000, lines:"login failed for admin\nlogin failed for admin\nhealth check ok\nhealth check ok\ndisk usage at 91%"};
   if(type === "file") return {type, path:"", text:""};
   return {type:"http", format:"ndjson", body:'{"message":"hello","level":"info"}\n{"message":"hello","level":"info"}\n{"message":"disk full","level":"error"}'};
@@ -455,6 +456,7 @@ function srcSummary(s){
     n = count(s.text);
     return n + " raw record" + (n === 1 ? "" : "s") + " handed to the next step as-is";
   }
+  if(s.type === "collector"){ const n = (s.text || "").split("\n").filter((l) => l.trim()).length; return n ? "Collector Lua, last run emitted " + n + " event" + (n === 1 ? "" : "s") + " from the mock API" : "Collector Lua against a mock API. Press Run collector."; }
   if(s.type === "generator") return "Sample logs: " + fmtN(s.count) + " x " + s.format;
   if(s.type === "file") return s.path ? s.path : (s.text ? "Pasted text (" + fmtN(s.text.split("\n").length) + " lines)" : "No input yet");
   return "POST a " + s.format + " body to a local HTTP listener";
@@ -566,7 +568,7 @@ function renderInspector(){
   if(sel === "source"){
     $("inspTitle").textContent = "Source";
     const s = pipe.source;
-    h += field("Type", '<select data-k="type" data-struct="1">' + opt("record","Paste a record (Auto Detect format)",s.type) + opt("generator","Sample log generator",s.type) + opt("file","File (paste or path)",s.type) + opt("http","HTTP listener",s.type) + '</select>');
+    h += field("Type", '<select data-k="type" data-struct="1">' + opt("record","Paste a record (Auto Detect format)",s.type) + opt("collector","Collector Lua + mock API (test auth)",s.type) + opt("generator","Sample log generator",s.type) + opt("file","File (paste or path)",s.type) + opt("http","HTTP listener",s.type) + '</select>');
     if(s.type === "record"){
       h += '<label class="setrow" style="border-bottom:0;padding:4px 0 8px"><input type="checkbox" data-multi="1"' + (s.multi ? " checked" : "") + '><span><b>Multiple log types</b> <span class="muted">(one stream with different event types, like Cloudflare)</span></span></label>';
     }
@@ -583,6 +585,25 @@ function renderInspector(){
     } else if(s.type === "record"){
       h += field("Raw record(s)", '<textarea data-k="text" spellcheck="false" placeholder="Paste in a record to test if Trickle can Auto Detect the format" style="min-height:260px">' + esc(s.text) + '</textarea>' + fmtRow("main"),
         "JSON, CEF, LEEF, key=value, Palo Alto PAN-OS CSV, XML, Apache/Nginx, or CSV/TSV/W3C with the header row first. This is what a collector would hand to the serializer. With only a Lua serializer after it, Vector is not used at all.", clearBtn("clearSource"));
+    } else if(s.type === "collector"){
+      const m = s.mock || (s.mock = {});
+      const mi = (k, label, ph) => field(label, '<input type="text" data-mk="' + k + '" spellcheck="false" placeholder="' + esc(ph || "") + '" value="' + esc(m[k] == null ? "" : m[k]) + '">');
+      h += field("Collector Lua", '<textarea data-k="code" spellcheck="false" placeholder="Paste a DPM collector: start(config), fetch { ... }, emit { log = event }" style="min-height:220px">' + esc(s.code) + '</textarea>',
+        "Runs with fetch, emit, get_chkpt and set_chkpt like the DPM runtime. Requests go to the mock API below, not the internet.",
+        '<button class="btn small" data-action="starterCollector">Insert starter collector</button>');
+      h += '<h3 style="margin:14px 0 4px">Mock API</h3>';
+      h += field("Authentication", '<select data-mk="auth">' + [["none","None"],["basic","Basic (id:secret)"],["apikey","API key header"],["bearer","Static Bearer token"],["oauth2_basic","OAuth2 client credentials: client_secret_basic"],["oauth2_post","OAuth2 client credentials: client_secret_post"]].map((o) => opt(o[0], o[1], m.auth || "none")).join("") + '</select>',
+        m.auth && m.auth.indexOf("oauth2") === 0 ? "Any URL ending in /token is the token endpoint; every other URL is the data endpoint and needs the issued Bearer token." : "");
+      if(m.auth === "basic" || (m.auth || "").indexOf("oauth2") === 0) h += mi("client_id", "Client ID / username", "sa_test") + mi("client_secret", "Client secret / password", "s3cret");
+      if(m.auth === "apikey") h += mi("key_header", "Header name", "x-api-key") + mi("key_value", "Key value", "test-key");
+      if(m.auth === "bearer") h += mi("bearer_token", "Bearer token", "test-token");
+      h += field("Response shape", '<select data-mk="shape">' + opt("array","Top-level JSON array",m.shape) + opt("data","{ \"data\": [ ... ] }",m.shape) + opt("events","{ \"events\": [ ... ] }",m.shape) + '</select>');
+      h += field("Records the data endpoint returns", '<textarea data-mk="records" spellcheck="false" placeholder="Paste JSON events: one object, an array, or one per line" style="min-height:140px">' + esc(m.records || "") + '</textarea>',
+        "Every data call returns all of these. Paging is not simulated yet.");
+      h += field("Checkpoint keys", '<input type="text" data-k="chkpt_keys" placeholder="SINCE_DATE_TIME" value="' + esc(s.chkpt_keys || "") + '">', "Keys the host source registers. Using any other key raises NotFoundChkptId, like the real runtime.");
+      h += field("Config JSON (optional)", '<textarea data-k="config" spellcheck="false" placeholder="{}" style="min-height:60px">' + esc(s.config || "") + '</textarea>', "Passed to start(config).");
+      h += '<div class="insp-actions" style="margin:12px 0 4px"><button class="btn small primary" data-action="runCollector">Run collector</button> ' + clearBtn("clearSource") + '</div>';
+      h += '<div class="hint">After a run, the emitted events become this pipeline source: press Generate on the serializer step to build the OCSF Lua from them.</div>';
     } else if(s.type === "generator"){
       h += field("Format", '<select data-k="format" data-struct="1">' + ["syslog","json","apache_common","apache_error","bsd_syslog","shuffle"].map((f) => opt(f,f,s.format)).join("") + '</select>');
       h += field("Number of events", '<input type="number" data-k="count" min="1" max="5000000" value="' + esc(s.count) + '">', "Vector generates these as fast as it can.");
@@ -1050,6 +1071,94 @@ function diffHTML(before, after){
   });
   return {html: h || '<div class="muted">No change.</div>', add: add, del: del};
 }
+const STARTER_COLLECTOR = `local json = require('json')
+local log = require('log')
+
+-- Edit these to match the vendor API. The mock API in Trickle checks them.
+local CLIENT_ID = "sa_test"
+local CLIENT_SECRET = "s3cret"
+local TOKEN_URL = "https://auth.example.com/oauth2/token"
+local EVENTS_URL = "https://api.example.com/v1/events"
+
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local function base64(data)
+    local out = {}
+    local bytes = { data:byte(1, #data) }
+    local i = 1
+    while i <= #bytes do
+        local b1, b2, b3 = bytes[i], bytes[i + 1], bytes[i + 2]
+        local n = b1 * 65536 + (b2 or 0) * 256 + (b3 or 0)
+        local c1 = math.floor(n / 262144) % 64
+        local c2 = math.floor(n / 4096) % 64
+        local c3 = math.floor(n / 64) % 64
+        local c4 = n % 64
+        out[#out + 1] = B64:sub(c1 + 1, c1 + 1)
+        out[#out + 1] = B64:sub(c2 + 1, c2 + 1)
+        out[#out + 1] = b2 and B64:sub(c3 + 1, c3 + 1) or "="
+        out[#out + 1] = b3 and B64:sub(c4 + 1, c4 + 1) or "="
+        i = i + 3
+    end
+    return table.concat(out)
+end
+
+function start(config)
+    local basic = base64(CLIENT_ID .. ":" .. CLIENT_SECRET)
+    fetch {
+        params = {
+            url = TOKEN_URL,
+            method = "POST",
+            headers = { ["Content-Type"] = "application/x-www-form-urlencoded", ["Authorization"] = "Basic " .. basic },
+            body = "grant_type=client_credentials"
+        },
+        fn = "on_token",
+        retry = true,
+        context = {}
+    }
+end
+
+function on_token(config, response, context)
+    if response.status ~= 200 then
+        log.error("token call failed: " .. tostring(response.status) .. " " .. tostring(response.body))
+        return
+    end
+    local data = json.decode(response.body)
+    fetch {
+        params = { url = EVENTS_URL, method = "GET", headers = { ["Authorization"] = "Bearer " .. data.access_token } },
+        fn = "on_events",
+        retry = true,
+        context = {}
+    }
+end
+
+function on_events(config, response, context)
+    if response.status ~= 200 then
+        log.error("events call failed: " .. tostring(response.status) .. " " .. tostring(response.body))
+        return
+    end
+    local events = json.decode(response.body)
+    for _, ev in ipairs(events) do
+        emit { log = ev }
+    end
+end
+`;
+async function runCollectorUI(){
+  const s = pipe.source;
+  banner("ok", "Running the collector against the mock API&hellip;");
+  try {
+    const r = await postJSON("/api/collector", s);
+    s.text = r.records.map((x) => JSON.stringify(x)).join("\n");
+    last = null; renderAll();
+    const rows = r.transcript.map((t) => '<div style="margin:3px 0"><b class="' + (t.auth_ok === false ? "fail" : "pass") + '">' + t.status + '</b> ' + esc(t.method) + ' <code>' + esc(t.url) + '</code> <span class="muted">(' + (t.kind === "token" ? "token call" : "data call") + ')</span><br><span class="muted">' + esc(t.note) + '. Sent: ' + esc(Object.entries(t.sent).map(([k, v]) => k + ": " + v).join("; ")) + '</span></div>').join("");
+    const msg = r.errors.length ? "<b>Collector problem:</b> " + r.errors.map(esc).join("; ")
+      : r.auth_failures ? "<b>Authentication failed " + r.auth_failures + " time" + (r.auth_failures === 1 ? "" : "s") + ".</b> Open the request log to see what the mock expected."
+      : "<b>Collector ran: " + r.requests + " request" + (r.requests === 1 ? "" : "s") + ", " + r.records.length + " event" + (r.records.length === 1 ? "" : "s") + " emitted.</b>"
+        + (r.records.length ? " Press Generate on the serializer step to build the OCSF Lua from them." : " Check the mock records and the response shape.");
+    banner(r.ok && !r.auth_failures ? "ok" : "err", msg
+      + (rows ? '<details open style="margin-top:6px"><summary>Request log (' + r.transcript.length + ')</summary>' + rows + '</details>' : "")
+      + (r.logs.length ? '<details style="margin-top:4px"><summary>Collector log</summary><pre style="white-space:pre-wrap">' + esc(r.logs.join("\n")) + '</pre></details>' : "")
+      + (r.printed.length ? '<details style="margin-top:4px"><summary>print() output</summary><pre style="white-space:pre-wrap">' + esc(r.printed.join("\n")) + '</pre></details>' : ""));
+  } catch(e){ banner("err", esc(e.message)); }
+}
 async function runBustedUI(){
   banner("ok", "Running Busted&hellip;");
   try {
@@ -1162,6 +1271,8 @@ document.addEventListener("click", async (ev) => {
   else if(a === "diffClose"){ pendingLua = null; $("diffModal").hidden = true; }
   else if(a === "theme"){ toggleTheme(); renderSettings(); }
   else if(a === "busted"){ await runBustedUI(); }
+  else if(a === "starterCollector"){ pipe.source.code = STARTER_COLLECTOR; last = null; renderAll(); }
+  else if(a === "runCollector"){ await runCollectorUI(); }
   else if(a === "bustedfix"){
     await proposeLua("/api/fixlua", {source: el.dataset.id, target: "busted"}, "Fix: " + el.dataset.note,
       () => "Fix added to the Lua: " + esc(el.dataset.note) + '. <button class="btn small" data-action="busted">Run Busted again</button>');
@@ -1192,7 +1303,7 @@ document.addEventListener("click", async (ev) => {
   }
   else if(a === "addType"){ pipe.source.types.push({name:"", text:""}); last = null; renderAll(); }
   else if(a === "clearType"){ const t = pipe.source.types[Number(el.dataset.i)]; if(t){ t.text = ""; } last = null; renderAll(); }
-  else if(a === "clearSource"){ if(pipe.source.multi){ (pipe.source.types || []).forEach((t) => { t.text = ""; }); }  const s = pipe.source; if("text" in s) s.text = ""; if("body" in s) s.body = ""; last = null; renderAll(); }
+  else if(a === "clearSource"){ if(pipe.source.type === "collector"){ pipe.source.code = ""; pipe.source.text = ""; if(pipe.source.mock) pipe.source.mock.records = ""; last = null; renderAll(); return; } if(pipe.source.multi){ (pipe.source.types || []).forEach((t) => { t.text = ""; }); }  const s = pipe.source; if("text" in s) s.text = ""; if("body" in s) s.body = ""; last = null; renderAll(); }
   else if(a === "newPipe"){ if(isDirty()) $("newModal").hidden = false; else startNew(); }
   else if(a === "newSave"){ $("newModal").hidden = true; if(await doSave()) startNew(); }
   else if(a === "newDiscard"){ $("newModal").hidden = true; startNew(); }
@@ -1215,6 +1326,7 @@ document.addEventListener("click", async (ev) => {
 function target(){ return sel === "source" ? pipe.source : sel === "sink" ? pipe.sink : pipe.transforms[sel]; }
 document.addEventListener("input", (ev) => {
   const el = ev.target;
+  if(el.dataset.mk !== undefined){ (pipe.source.mock || (pipe.source.mock = {}))[el.dataset.mk] = el.value; return; }
   if(el.dataset.fmtpat !== undefined){ const k = el.dataset.fmtpat, o = fmtObj(k); if(o){ if(k === "main") o.rpat = el.value; else o.pattern = el.value; detectFmt(k, 400); } return; }
   if(el.dataset.ti !== undefined){ const t = pipe.source.types[Number(el.dataset.ti)]; if(t) t[el.dataset.tk] = el.value; if(el.dataset.tk === "text") detectFmt(el.dataset.ti, 400); return; }
   if(el.dataset.k){
@@ -1229,6 +1341,7 @@ document.addEventListener("input", (ev) => {
 });
 document.addEventListener("change", async (ev) => {
   const el = ev.target;
+  if(el.dataset.mk !== undefined){ (pipe.source.mock || (pipe.source.mock = {}))[el.dataset.mk] = el.value; if(el.dataset.mk === "auth"){ renderInspector(); } return; }
   if(el.dataset.fmtsel !== undefined){
     const k = el.dataset.fmtsel, o = fmtObj(k);
     if(o){ if(k === "main") o.rfmt = el.value; else o.format = el.value; renderInspector(); detectFmt(k, 0); }

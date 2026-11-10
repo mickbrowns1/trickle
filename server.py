@@ -38,6 +38,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 import formats as fm
+import mockapi
 
 HERE = Path(__file__).resolve().parent
 PIPE_DIR = HERE / "pipelines"
@@ -1364,9 +1365,89 @@ def generate_serializer(text, vendor="", product="", version="", forced="auto", 
 MAX_LOG_TYPES = 20
 
 
+COLLECTOR_TIMEOUT = 30
+
+
+def run_collector(src):
+    """Run a DPM collector Lua against the mock API. Returns records, the request transcript and any errors."""
+    code = str(src.get("code") or "")
+    if not code.strip():
+        raise ApiError("Paste a collector Lua script first, or press Insert starter collector.")
+    if len(code.encode("utf-8")) > MAX_CODE_BYTES:
+        raise ApiError("The collector is larger than 1 MB.")
+    lua = find_lua()
+    if not lua:
+        raise ApiError("No Lua interpreter found. Install one with: brew install luajit", 409)
+    mock_cfg = src.get("mock") if isinstance(src.get("mock"), dict) else {}
+    rec_text = str(mock_cfg.get("records") or "").strip()
+    records = parse_records(rec_text) if rec_text else []
+    api = mockapi.MockApi(mock_cfg, records)
+    cfg_text = str(src.get("config") or "").strip()
+    try:
+        config = json.loads(cfg_text) if cfg_text else {}
+    except ValueError:
+        raise ApiError("The collector config is not valid JSON.")
+    keys = [k.strip() for k in re.split(r"[,\s]+", str(src.get("chkpt_keys") or "")) if k.strip()][:20]
+    run_dir = Path(tempfile.mkdtemp(prefix="pipelab_col_"))
+    out = {"ok": True, "records": [], "transcript": api.transcript, "logs": [], "errors": [], "printed": [], "requests": 0}
+    try:
+        (run_dir / "collector.lua").write_text(code, encoding="utf-8")
+        (run_dir / "settings.json").write_text(json.dumps({"config": config, "chkpt_keys": keys, "max_requests": 50}), encoding="utf-8")
+        proc = subprocess.Popen([lua, str(HERE / "collector_runner.lua"), "collector.lua", "settings.json"], cwd=str(run_dir),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=clean_env())
+        timer = threading.Timer(COLLECTOR_TIMEOUT, proc.kill)
+        timer.start()
+        try:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                try:
+                    m = json.loads(line)
+                except ValueError:
+                    if line.strip():
+                        out["printed"].append(line[:300])
+                    continue
+                t = m.get("t") if isinstance(m, dict) else None
+                if t == "req":
+                    resp = api.handle(m.get("params") or {})
+                    proc.stdin.write(json.dumps(resp) + "\n")
+                    proc.stdin.flush()
+                elif t == "emit":
+                    if len(out["records"]) < MAX_RECORDS and isinstance(m.get("log"), dict):
+                        out["records"].append(m["log"])
+                    elif not isinstance(m.get("log"), dict):
+                        out["errors"].append("emit { log = ... } must be a table, got %s" % type(m.get("log")).__name__)
+                elif t == "log":
+                    out["logs"].append("%s: %s" % (m.get("level"), m.get("msg")))
+                elif t in ("error", "fatal"):
+                    out["errors"].append(("%s: " % m["where"] if m.get("where") else "") + tidy(str(m.get("error"))))
+                    if t == "fatal":
+                        out["ok"] = False
+                elif t == "done":
+                    out["requests"] = m.get("requests", 0)
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            proc.wait(timeout=5)
+            timer.cancel()
+        if proc.returncode not in (0, None) and not out["errors"]:
+            out["errors"].append("The collector runner stopped (timed out after %d seconds?)." % COLLECTOR_TIMEOUT)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+    out["ok"] = out["ok"] and not out["errors"]
+    out["auth_failures"] = sum(1 for t in api.transcript if t["auth_ok"] is False)
+    return out
+
+
 def norm_pipeline(p):
     """Multi-type record source: merge every filled box into the single record stream the rest of Trickle expects."""
     src = (p or {}).get("source") or {}
+    if src.get("type") == "collector":          # the last collector run left its events in text
+        if not str(src.get("text", "")).strip():
+            raise ApiError("Run the collector first (Source, Run collector). Its emitted events are what the next step receives.")
+        src["type"] = "record"
+        return p
     if src.get("type") == "record" and src.get("multi") and isinstance(src.get("types"), list):
         lines = []
         for t in src["types"][:MAX_LOG_TYPES]:
@@ -2950,6 +3031,8 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(b.get("types"), list):
                     return self._json(200, generate_multi(b["types"], b.get("vendor", ""), b.get("product", ""), b.get("version", "")))
                 return self._json(200, generate_serializer(b.get("text", ""), b.get("vendor", ""), b.get("product", ""), b.get("version", ""), b.get("format") or "auto", b.get("pattern") or ""))
+            if method == "POST" and path == "/api/collector":
+                return self._json(200, run_collector(self._read_json()))
             if method == "POST" and path == "/api/detect":
                 b = self._read_json()
                 return self._json(200, detect_info(b.get("text", ""), b.get("format") or "auto", b.get("pattern") or ""))

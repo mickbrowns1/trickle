@@ -14,7 +14,7 @@ COPY --from=vector /usr/bin/vector /usr/local/bin/vector
 
 RUN useradd --create-home --uid 10001 lab
 WORKDIR /app
-COPY server.py formats.py index.html lua_runner.lua ./
+COPY server.py formats.py mockapi.py index.html lua_runner.lua collector_runner.lua ./
 COPY pipelines ./pipelines
 RUN mkdir -p /app/output /data && chown -R lab:lab /app /data
 
