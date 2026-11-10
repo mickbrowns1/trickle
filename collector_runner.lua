@@ -140,6 +140,34 @@ do
       error(name .. "." .. tostring(k) .. " is not available in Trickle. Known here: " .. table.concat(known, ", ") .. ". Check the DPM docs for the real name.", 2)
     end })
   end
+  -- scol-std: in-memory token locks, same calls as the DPM module (try_acquire_token, renew_token, release_token)
+  local locks = {}
+  package.loaded["__trickle_locks"] = locks
+  local counter = 0
+  local function new_token() counter = counter + 1; return "tok-" .. counter .. "-" .. os.time() end
+  package.loaded["scol-std"] = {
+    lock = guarded("scol-std lock", {
+      try_acquire_token = function(key, ttl)
+        local cur = locks[key]
+        if cur and cur.expires > os.time() then return false, nil end
+        local tok = new_token()
+        locks[key] = { token = tok, expires = os.time() + (tonumber(ttl) or 600) }
+        return true, tok
+      end,
+      renew_token = function(key, token, ttl)
+        local cur = locks[key]
+        if not cur or cur.token ~= token then return false, nil end
+        cur.token = new_token()
+        cur.expires = os.time() + (tonumber(ttl) or 600)
+        return true, cur.token
+      end,
+      release_token = function(key, token)
+        local cur = locks[key]
+        if cur and cur.token == token then locks[key] = nil; return true end
+        return false
+      end,
+    }),
+  }
   package.loaded["hmac"] = guarded("hmac", { sha1 = hmac_with(sha1), sha256 = hmac_with(sha256) })
   package.loaded["codec"] = guarded("codec", {
     hex_lower_encode = function(s) return (tostring(s):gsub(".", function(c) return string.format("%02x", c:byte()) end)) end,
@@ -195,7 +223,18 @@ function emit(spec)
   send({ t = "emit", log = spec.log })
 end
 
-local chunk, err = loadfile(col_path)
+-- The DPM config loader runs variable substitution over the whole source: $$ becomes one literal $ and any
+-- $name is a required environment variable that is not set (rule 7). Mirror that so Entra style $$top works.
+local cf = assert(io.open(col_path, "rb"))
+local csrc = cf:read("*a")
+cf:close()
+local escaped = csrc:gsub("%$%$", "\1")
+local missing = escaped:match("%$([%a_][%w_]*)")
+if missing then
+  send({ t = "fatal", error = "Invalid dataplane configuration: Missing environment variable in config. name = \"" .. missing .. "\" (a $name token anywhere in the Lua, comments included, is treated as an env var; write $$ for a literal $)" })
+  os.exit(1)
+end
+local chunk, err = (loadstring or load)((escaped:gsub("\1", "$")), "=collector")
 if not chunk then send({ t = "fatal", error = tostring(err) }); os.exit(1) end
 local ok, e = pcall(chunk)
 if not ok then send({ t = "fatal", error = tostring(e) }); os.exit(1) end
@@ -224,5 +263,8 @@ while #queue > 0 do
     local cok, cerr = pcall(cb, config, resp, req.context or {})
     if not cok then send({ t = "error", where = req.fn, error = tostring(cerr) }) end
   end
+end
+for key, cur in pairs(package.loaded["__trickle_locks"] or {}) do
+  send({ t = "log", level = "warn", msg = "lock " .. key .. " was still held when the run ended: a path that returns without release_token stalls that stream until the TTL expires" })
 end
 send({ t = "done", requests = calls })

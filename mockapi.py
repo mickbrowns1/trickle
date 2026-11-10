@@ -3,7 +3,8 @@
 Auth modes: none, darktrace (self-signed HMAC-SHA1 DTAPI headers), host (the DPM host source injects auth, so the script should send none), basic, apikey, bearer,
 oauth2_basic (client_secret_basic), oauth2_post (client_secret_post).
 Paging styles: none, link (Link: rel="next" header, Okta style), search_after (X-Search_after header, JumpCloud style),
-cursor (next_cursor in the body), page (page number).
+cursor (next_cursor in the body), page (page number), odata (@odata.nextLink with $skiptoken, Microsoft Graph),
+offset (limit and offset query parameters, Netskope).
 Any URL whose last path segment is "token" (or ends with /token) is the token endpoint for the OAuth2 modes;
 every other URL is the data endpoint. The data endpoint serves the pasted records in one response.
 """
@@ -11,14 +12,16 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 AUTH_MODES = ("none", "host", "darktrace", "basic", "apikey", "bearer", "oauth2_basic", "oauth2_post")
-PAGING = ("none", "link", "search_after", "cursor", "page")
-LIMIT_KEYS = ("limit", "per_page", "page_size", "pageSize", "maxResults", "max_results")
-TIME_PAIRS = (("starttime", "endtime"), ("start", "end"), ("from", "to"), ("since", "until"), ("start_time", "end_time"))
+PAGING = ("none", "link", "search_after", "cursor", "page", "odata", "offset")
+SHAPES = ("array", "data", "events", "value", "result")
+LIMIT_KEYS = ("$top", "limit", "per_page", "page_size", "pageSize", "maxResults", "max_results")
+TIME_PAIRS = (("starttime", "endtime"), ("insertionstarttime", "insertionendtime"), ("start", "end"), ("from", "to"), ("since", "until"), ("start_time", "end_time"))
 CURSOR_KEYS = ("cursor", "next", "page_token", "after_cursor", "starting_after")
 
 
@@ -82,7 +85,8 @@ class MockApi:
         self.key_header = str(cfg.get("key_header") or "x-api-key")
         self.key_value = str(cfg.get("key_value") or "")
         self.bearer_token = str(cfg.get("bearer_token") or "")
-        self.shape = cfg.get("shape") if cfg.get("shape") in ("array", "data", "events") else "array"
+        self.shape = cfg.get("shape") if cfg.get("shape") in SHAPES else "array"
+        self.time_unit = cfg.get("time_unit") if cfg.get("time_unit") in ("ms", "s", "iso") else "ms"
         try:
             self.ttl = int(cfg.get("token_ttl") or 3600)
         except (TypeError, ValueError):
@@ -279,11 +283,13 @@ class MockApi:
         u = urlparse(req["url"])
         path = "/" + u.path.strip("/")
         recs, note = self.records, ""
-        if path in self.routes:
-            val = self.routes[path]
+        qp = parse_qsl(u.query, keep_blank_values=True)
+        rkey = next((path + "?" + k + "=" + v for k, v in qp if (path + "?" + k + "=" + v) in self.routes), path)
+        if rkey in self.routes:
+            val = self.routes[rkey]
             if not isinstance(val, list):
                 return [], val, ""
-            recs, note = val, "; route " + path
+            recs, note = val, "; route " + rkey
         if self.window_mode == "off" or not self.time_field:
             return recs, None, note
         q = {k: v for k, v in parse_qsl(u.query, keep_blank_values=True)}
@@ -294,14 +300,19 @@ class MockApi:
                     return recs, None, note
                 break
         else:
-            return recs, None, note + "; no time window in the request"
+            fm = re.search(r"\bge\s+(\S+)\s+and\s+\w+\s+le\s+(\S+)", q.get("$filter", ""))
+            lo, hi = (self._ms(fm.group(1)), self._ms(fm.group(2))) if fm else (None, None)
+            if lo is None or hi is None:
+                return recs, None, note + "; no time window in the request"
         if self.window_mode == "spread":
             n = len(recs)
             out = []
             for i, rec in enumerate(recs):
                 c = dict(rec) if isinstance(rec, dict) else rec
                 if isinstance(c, dict):
-                    c[self.time_field] = lo + (hi - lo) * (i + 1) // (n + 1)
+                    t = lo + (hi - lo) * (i + 1) // (n + 1)
+                    c[self.time_field] = (t if self.time_unit == "ms" else t // 1000 if self.time_unit == "s" else
+                                          datetime.fromtimestamp(t / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
                 out.append(c)
             return out, None, note + "; %d record(s) spread across the requested window %d-%d" % (n, lo, hi)
         out = []
@@ -315,7 +326,7 @@ class MockApi:
     def _wrap(self, recs, more=None):
         if self.shape == "array" and more is None:
             return recs
-        key = "events" if self.shape == "events" else "data"
+        key = self.shape if self.shape in ("events", "value", "result") else "data"
         out = {key: recs}
         out.update(more or {})
         return out
@@ -371,6 +382,20 @@ class MockApi:
             extra = {"X-Result-Count": str(end - start), "X-Limit": str(limit), "X-Sort": "ASC",
                      "X-Search_after": json.dumps([1576181718000 + end, "idx-%d" % end])}
             note = "; records %d-%d of %d, X-Result-Count %d vs X-Limit %d" % (start + 1 if end > start else start, end, total, end - start, limit)
+        elif self.paging == "odata":
+            tok = q.get("$skiptoken")
+            start = idx(tok) if tok else 0
+            end = min(total, start + limit)
+            wrapper = {}
+            if end < total:
+                nxt = re.sub(r"[?&]\$skiptoken=[^&]*", "", req["url"])
+                nxt += ("&" if "?" in nxt else "?") + "$skiptoken=st-%d" % end
+                wrapper["@odata.nextLink"] = nxt
+            note = "; records %d-%d of %d, %s" % (start + 1 if end > start else start, end, total, "has @odata.nextLink" if wrapper else "no @odata.nextLink (last page)")
+        elif self.paging == "offset":
+            start = idx(q.get("offset") or jb.get("offset"))
+            end = min(total, start + limit)
+            note = "; offset %d, limit %d, returned %d of %d" % (start, limit, end - start, total)
         elif self.paging == "cursor":
             cur = next((q.get(k) or jb.get(k) for k in CURSOR_KEYS if q.get(k) or jb.get(k)), None)
             start = idx(cur)

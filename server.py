@@ -1398,11 +1398,15 @@ def run_collector(src):
     if not isinstance(seed, dict):
         raise ApiError("Checkpoint seeds must be a JSON object.")
     def _seed_val(v):
-        # {now_ms-2h} and {now_ms+30m} expand to epoch milliseconds relative to the run time
+        # {now_ms-2h} and {now_s-6h} expand to epoch milliseconds or seconds relative to the run time (units s, m, h, d)
         def sub(m):
-            mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(3) or "s"]
-            return str(int(time.time() * 1000) + (1 if m.group(1) == "+" else -1) * int(m.group(2)) * mult * 1000) if m.group(1) else str(int(time.time() * 1000))
-        return re.sub(r"\{now_ms(?:([+-])(\d+)([smhd])?)?\}", sub, v)
+            now = time.time()
+            delta = 0
+            if m.group(2):
+                delta = (1 if m.group(2) == "+" else -1) * int(m.group(3)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(4) or "s"]
+            t = now + delta
+            return str(int(t * 1000)) if m.group(1) == "ms" else str(int(t))
+        return re.sub(r"\{now_(ms|s)(?:([+-])(\d+)([smhd])?)?\}", sub, v)
     seed = {k: _seed_val(v) for k, v in seed.items() if isinstance(v, str)}
     run_dir = Path(tempfile.mkdtemp(prefix="pipelab_col_"))
     out = {"ok": True, "records": [], "transcript": api.transcript, "logs": [], "errors": [], "printed": [], "requests": 0}
