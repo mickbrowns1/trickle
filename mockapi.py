@@ -1,15 +1,21 @@
 """Fake vendor API for Trickle's collector runner. No sockets: the runner hands each fetch{} request here.
 
-Auth modes: none, basic, apikey, bearer, oauth2_basic (client_secret_basic), oauth2_post (client_secret_post).
+Auth modes: none, host (the DPM host source injects auth, so the script should send none), basic, apikey, bearer,
+oauth2_basic (client_secret_basic), oauth2_post (client_secret_post).
+Paging styles: none, link (Link: rel="next" header, Okta style), search_after (X-Search_after header, JumpCloud style),
+cursor (next_cursor in the body), page (page number).
 Any URL whose last path segment is "token" (or ends with /token) is the token endpoint for the OAuth2 modes;
 every other URL is the data endpoint. The data endpoint serves the pasted records in one response.
 """
 import base64
 import json
 import secrets
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-AUTH_MODES = ("none", "basic", "apikey", "bearer", "oauth2_basic", "oauth2_post")
+AUTH_MODES = ("none", "host", "basic", "apikey", "bearer", "oauth2_basic", "oauth2_post")
+PAGING = ("none", "link", "search_after", "cursor", "page")
+LIMIT_KEYS = ("limit", "per_page", "page_size", "pageSize", "maxResults", "max_results")
+CURSOR_KEYS = ("cursor", "next", "page_token", "after_cursor", "starting_after")
 
 
 def _hdr(headers, name):
@@ -69,18 +75,28 @@ class MockApi:
             self.ttl = int(cfg.get("token_ttl") or 3600)
         except (TypeError, ValueError):
             self.ttl = 3600
+        self.paging = cfg.get("paging") if cfg.get("paging") in PAGING else "none"
+        try:
+            self.page_size = max(0, int(cfg.get("page_size") or 0))
+        except (TypeError, ValueError):
+            self.page_size = 0
+        self.link_last = "always" if cfg.get("link_last") == "always" else "omit"
+        self.lower = cfg.get("header_case") != "asis"
         self.records = records
         self.tokens = set()
         self.n = 0
         self.transcript = []
 
-    def _resp(self, status, body, note, req, headers=None, auth_ok=None, kind="data"):
+    def _resp(self, status, body, note, req, headers=None, auth_ok=None, kind="data", warn=None):
         text = body if isinstance(body, str) else json.dumps(body)
         h = {"Content-Type": "application/json"}
         h.update(headers or {})
+        if self.lower:
+            h = {k.lower(): v for k, v in h.items()}
         self.transcript.append({"n": self.n, "method": req["method"], "url": req["url"], "status": status, "kind": kind,
-                                "note": note, "auth_ok": auth_ok, "sent": _mask(req["headers"]),
-                                "body_sent": (req["body"] or "")[:300], "reply": text[:200]})
+                                "note": note, "auth_ok": auth_ok, "warn": warn, "sent": _mask(req["headers"]),
+                                "body_sent": (req["body"] or "")[:300], "reply": text[:200],
+                                "reply_headers": {k: (v if isinstance(v, str) else str(v))[:160] for k, v in h.items() if k.lower() != "content-type"}})
         return {"status": status, "body": text, "headers": h}
 
     def _is_token_url(self, url):
@@ -133,9 +149,15 @@ class MockApi:
 
     # -- data endpoint ----------------------------------------------------
     def _data(self, req):
-        ok, why, hdrs = True, "no auth required", {}
+        ok, why, hdrs, warn = True, "no auth required", {}, None
         h = req["headers"]
-        if self.mode == "basic":
+        if self.mode == "host":
+            why = "auth is injected by the host source in DPM, so the script needs none"
+            sent = [k for k in h if str(k).lower() in ("authorization", "x-api-key", "api-key") or "token" in str(k).lower() or "key" in str(k).lower()]
+            if sent:
+                warn = ("the script sent %s. A host that injects auth overwrites it on every call, so remove it from the script"
+                        % ", ".join(str(k) for k in sent))
+        elif self.mode == "basic":
             b = _basic(h)
             ok = b == (self.client_id, self.client_secret)
             why = ("Authorization: Basic matched" if ok else
@@ -162,6 +184,84 @@ class MockApi:
             hdrs = {"WWW-Authenticate": "Bearer"}
         if not ok:
             return self._resp(401, {"error": "unauthorized", "message": why}, why, req, hdrs, auth_ok=False)
-        recs = self.records
-        body = recs if self.shape == "array" else {("data" if self.shape == "data" else "events"): recs}
-        return self._resp(200, body, why, req, auth_ok=True)
+        body, extra, pnote = self._page(req)
+        return self._resp(200, body, why + pnote, req, extra, auth_ok=True, warn=warn)
+
+    # -- paging -----------------------------------------------------------
+    def _wrap(self, recs, more=None):
+        if self.shape == "array" and more is None:
+            return recs
+        key = "events" if self.shape == "events" else "data"
+        out = {key: recs}
+        out.update(more or {})
+        return out
+
+    def _page(self, req):
+        recs, total = self.records, len(self.records)
+        if self.paging == "none":
+            return self._wrap(recs), {}, ""
+        u = urlparse(req["url"])
+        q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
+        try:
+            jb = json.loads(req["body"]) if req["body"] else {}
+        except ValueError:
+            jb = {}
+        jb = jb if isinstance(jb, dict) else {}
+        limit = 0
+        for k in LIMIT_KEYS:
+            v = q.get(k, jb.get(k))
+            try:
+                if v is not None and int(v) > 0:
+                    limit = int(v)
+                    break
+            except (TypeError, ValueError):
+                pass
+        if self.page_size:
+            limit = min(limit, self.page_size) if limit else self.page_size
+        limit = limit or 1000
+
+        def idx(v):
+            try:
+                return max(0, int(str(v).split("-")[-1]))
+            except (TypeError, ValueError):
+                return 0
+
+        extra, wrapper = {}, None
+        if self.paging == "link":
+            start = idx(q.get("after"))
+            end = min(total, start + limit)
+            base = urlunparse((u.scheme, u.netloc, u.path, "", "", ""))
+            def link(after):
+                qq = dict(q)
+                qq["after"] = str(after)
+                return "<%s?%s>" % (base, urlencode(qq))
+            parts = ['<%s>; rel="self"' % req["url"]]
+            if end < total or self.link_last == "always":
+                parts.append(link(end) + '; rel="next"')
+            extra = {"Link": ", ".join(parts)}
+            note = "; records %d-%d of %d, Link %s" % (start + 1 if end > start else start, end, total, "has rel=next" if len(parts) > 1 else "has no rel=next (last page)")
+        elif self.paging == "search_after":
+            sa = q.get("search_after") or jb.get("search_after")
+            start = idx(sa[-1]) if isinstance(sa, list) and sa else (idx(sa) if sa else 0)
+            end = min(total, start + limit)
+            extra = {"X-Result-Count": str(end - start), "X-Limit": str(limit), "X-Sort": "ASC",
+                     "X-Search_after": json.dumps([1576181718000 + end, "idx-%d" % end])}
+            note = "; records %d-%d of %d, X-Result-Count %d vs X-Limit %d" % (start + 1 if end > start else start, end, total, end - start, limit)
+        elif self.paging == "cursor":
+            cur = next((q.get(k) or jb.get(k) for k in CURSOR_KEYS if q.get(k) or jb.get(k)), None)
+            start = idx(cur)
+            end = min(total, start + limit)
+            wrapper = {"next_cursor": ("c-%d" % end) if end < total else None, "has_more": end < total}
+            note = "; records %d-%d of %d, next_cursor %s" % (start + 1 if end > start else start, end, total, wrapper["next_cursor"])
+        else:
+            page = 1
+            try:
+                page = max(1, int(q.get("page", jb.get("page", 1))))
+            except (TypeError, ValueError):
+                pass
+            start = (page - 1) * limit
+            end = min(total, start + limit)
+            pages = max(1, -(-total // limit))
+            extra = {"X-Total-Count": str(total), "X-Total-Pages": str(pages), "X-Page": str(page)}
+            note = "; page %d of %d, records %d-%d of %d" % (page, pages, start + 1 if end > start else start, end, total)
+        return self._wrap(recs[start:end], wrapper), extra, note

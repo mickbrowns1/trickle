@@ -1388,11 +1388,18 @@ def run_collector(src):
     except ValueError:
         raise ApiError("The collector config is not valid JSON.")
     keys = [k.strip() for k in re.split(r"[,\s]+", str(src.get("chkpt_keys") or "")) if k.strip()][:20]
+    seed_text = str(src.get("chkpt_seed") or "").strip()
+    try:
+        seed = json.loads(seed_text) if seed_text else {}
+    except ValueError:
+        raise ApiError("Checkpoint seeds must be a JSON object such as {\"initial_since\": \"2026-11-01T00:00:00Z\"}.")
+    if not isinstance(seed, dict):
+        raise ApiError("Checkpoint seeds must be a JSON object.")
     run_dir = Path(tempfile.mkdtemp(prefix="pipelab_col_"))
     out = {"ok": True, "records": [], "transcript": api.transcript, "logs": [], "errors": [], "printed": [], "requests": 0}
     try:
         (run_dir / "collector.lua").write_text(code, encoding="utf-8")
-        (run_dir / "settings.json").write_text(json.dumps({"config": config, "chkpt_keys": keys, "max_requests": 50}), encoding="utf-8")
+        (run_dir / "settings.json").write_text(json.dumps({"config": config, "chkpt_keys": keys, "chkpt_seed": {k: v for k, v in seed.items() if isinstance(v, str)}, "max_requests": 50}), encoding="utf-8")
         proc = subprocess.Popen([lua, str(HERE / "collector_runner.lua"), "collector.lua", "settings.json"], cwd=str(run_dir),
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=clean_env())
         timer = threading.Timer(COLLECTOR_TIMEOUT, proc.kill)
@@ -1437,6 +1444,7 @@ def run_collector(src):
         shutil.rmtree(run_dir, ignore_errors=True)
     out["ok"] = out["ok"] and not out["errors"]
     out["auth_failures"] = sum(1 for t in api.transcript if t["auth_ok"] is False)
+    out["warnings"] = [t["warn"] for t in api.transcript if t.get("warn")][:5]
     return out
 
 

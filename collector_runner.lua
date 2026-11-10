@@ -41,6 +41,9 @@ local MAX_REQUESTS = settings.max_requests or 50
 
 -- checkpoints: keys must be registered, values must be strings
 local store = {}
+for k, v in pairs(settings.chkpt_seed or {}) do
+  if allowed[k] and type(v) == "string" then store[k] = v end
+end
 function set_chkpt(key, value)
   if not allowed[key] then error("NotFoundChkptId key: ComponentKey id: " .. tostring(key) .. " (register it under Checkpoint keys)", 2) end
   if type(value) ~= "string" then error("checkpoint values must be strings, got " .. type(value) .. " (json.encode structured data)", 2) end
