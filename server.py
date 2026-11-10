@@ -1382,6 +1382,8 @@ def run_collector(src):
     rec_text = str(mock_cfg.get("records") or "").strip()
     records = parse_records(rec_text) if rec_text else []
     api = mockapi.MockApi(mock_cfg, records)
+    if api.config_error:
+        raise ApiError(api.config_error)
     cfg_text = str(src.get("config") or "").strip()
     try:
         config = json.loads(cfg_text) if cfg_text else {}
@@ -1395,11 +1397,18 @@ def run_collector(src):
         raise ApiError("Checkpoint seeds must be a JSON object such as {\"initial_since\": \"2026-11-01T00:00:00Z\"}.")
     if not isinstance(seed, dict):
         raise ApiError("Checkpoint seeds must be a JSON object.")
+    def _seed_val(v):
+        # {now_ms-2h} and {now_ms+30m} expand to epoch milliseconds relative to the run time
+        def sub(m):
+            mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(3) or "s"]
+            return str(int(time.time() * 1000) + (1 if m.group(1) == "+" else -1) * int(m.group(2)) * mult * 1000) if m.group(1) else str(int(time.time() * 1000))
+        return re.sub(r"\{now_ms(?:([+-])(\d+)([smhd])?)?\}", sub, v)
+    seed = {k: _seed_val(v) for k, v in seed.items() if isinstance(v, str)}
     run_dir = Path(tempfile.mkdtemp(prefix="pipelab_col_"))
     out = {"ok": True, "records": [], "transcript": api.transcript, "logs": [], "errors": [], "printed": [], "requests": 0}
     try:
         (run_dir / "collector.lua").write_text(code, encoding="utf-8")
-        (run_dir / "settings.json").write_text(json.dumps({"config": config, "chkpt_keys": keys, "chkpt_seed": {k: v for k, v in seed.items() if isinstance(v, str)}, "max_requests": 50}), encoding="utf-8")
+        (run_dir / "settings.json").write_text(json.dumps({"config": config, "chkpt_keys": keys, "chkpt_seed": seed, "max_requests": 50}), encoding="utf-8")
         proc = subprocess.Popen([lua, str(HERE / "collector_runner.lua"), "collector.lua", "settings.json"], cwd=str(run_dir),
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=clean_env())
         timer = threading.Timer(COLLECTOR_TIMEOUT, proc.kill)

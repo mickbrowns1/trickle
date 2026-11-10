@@ -592,9 +592,10 @@ function renderInspector(){
         "Runs with fetch, emit, get_chkpt and set_chkpt like the DPM runtime. Requests go to the mock API below, not the internet.",
         '<button class="btn small" data-action="starterCollector">Insert starter for this auth type</button>');
       h += '<h3 style="margin:14px 0 4px">Mock API</h3>';
-      h += field("Authentication", '<select data-mk="auth">' + [["none","None"],["host","Host injects auth (script sends none)"],["basic","Basic (id:secret)"],["apikey","API key header"],["bearer","Static Bearer token"],["oauth2_basic","OAuth2 client credentials: client_secret_basic"],["oauth2_post","OAuth2 client credentials: client_secret_post"]].map((o) => opt(o[0], o[1], m.auth || "none")).join("") + '</select>',
-        m.auth === "host" ? "For platform-managed auth (Okta and similar). The mock accepts every call and warns if your script sends its own Authorization or key header, because the host would overwrite it." : m.auth && m.auth.indexOf("oauth2") === 0 ? "Any URL ending in /token is the token endpoint; every other URL is the data endpoint and needs the issued Bearer token." : "");
+      h += field("Authentication", '<select data-mk="auth">' + [["none","None"],["host","Host injects auth (script sends none)"],["darktrace","Self-signed HMAC-SHA1 (Darktrace DTAPI headers)"],["basic","Basic (id:secret)"],["apikey","API key header"],["bearer","Static Bearer token"],["oauth2_basic","OAuth2 client credentials: client_secret_basic"],["oauth2_post","OAuth2 client credentials: client_secret_post"]].map((o) => opt(o[0], o[1], m.auth || "none")).join("") + '</select>',
+        m.auth === "darktrace" ? "The mock recomputes HMAC-SHA1(private, path?sorted_query, newline, public, newline, date) and compares it to DTAPI-Signature. A mismatch shows what it signed." : m.auth === "host" ? "For platform-managed auth (Okta and similar). The mock accepts every call and warns if your script sends its own Authorization or key header, because the host would overwrite it." : m.auth && m.auth.indexOf("oauth2") === 0 ? "Any URL ending in /token is the token endpoint; every other URL is the data endpoint and needs the issued Bearer token." : "");
       if(m.auth === "basic" || (m.auth || "").indexOf("oauth2") === 0) h += mi("client_id", "Client ID / username", "sa_test") + mi("client_secret", "Client secret / password", "s3cret");
+      if(m.auth === "darktrace") h += mi("public_token", "Public token", "pub_test") + mi("private_token", "Private token", "priv_test");
       if(m.auth === "apikey") h += mi("key_header", "Header name", "x-api-key") + mi("key_value", "Key value", "test-key");
       if(m.auth === "bearer") h += mi("bearer_token", "Bearer token", "test-token");
       h += field("Response shape", '<select data-mk="shape">' + opt("array","Top-level JSON array",m.shape) + opt("data","{ \"data\": [ ... ] }",m.shape) + opt("events","{ \"events\": [ ... ] }",m.shape) + '</select>');
@@ -605,11 +606,15 @@ function renderInspector(){
         if(m.paging === "link") h += field("Last page", '<select data-mk="link_last">' + opt("omit","No rel=next on the last page (realistic)",m.link_last || "omit") + opt("always","Always send rel=next (never ends)",m.link_last || "omit") + '</select>')
           + field("Header name case", '<select data-mk="header_case">' + opt("lower","lowercase (link)",m.header_case || "lower") + opt("asis","As sent (Link)",m.header_case || "lower") + '</select>', "Scripts that read response.headers[\"link\"] only work with lowercase.");
       }
+      h += field("Time windows", '<select data-mk="window_mode">' + opt("off","Off: ignore starttime/endtime",m.window_mode || "off") + opt("spread","Spread records across the requested window",m.window_mode || "off") + opt("filter","Filter records to the requested window",m.window_mode || "off") + '</select>',
+        "For APIs that take a time range (starttime/endtime, start/end, from/to, since/until; seconds, milliseconds or ISO). Spread always lands records inside the window, so sample data never ages out.");
+      if(m.window_mode && m.window_mode !== "off") h += mi("time_field", "Record time field", "time");
       h += field("Records the data endpoint returns", '<textarea data-mk="records" spellcheck="false" placeholder="Paste JSON events: one object, an array, or one per line" style="min-height:140px">' + esc(m.records || "") + '</textarea>',
         "Served in pages when paging is on, otherwise all on every call.");
+      h += field("Extra endpoints (optional JSON)", '<textarea data-mk="routes" spellcheck="false" placeholder="{&quot;/status&quot;: {&quot;version&quot;: &quot;6.1&quot;}, &quot;/groups&quot;: [{&quot;id&quot;: 1}]}" style="min-height:60px">' + esc(m.routes || "") + '</textarea>', "Path to reply. An array is served like the records above; an object is returned as is. Any other path gets the records above.");
       h += field("Checkpoint keys", '<input type="text" data-k="chkpt_keys" placeholder="SINCE_DATE_TIME" value="' + esc(s.chkpt_keys || "") + '">', "Keys the host source registers. Using any other key raises NotFoundChkptId, like the real runtime.",
-        '<button class="btn small" data-action="presetOkta">Okta preset</button>');
-      h += field("Checkpoint starting values (optional JSON)", '<textarea data-k="chkpt_seed" spellcheck="false" placeholder="{&quot;initial_since&quot;: &quot;2026-11-01T00:00:00Z&quot;}" style="min-height:44px">' + esc(s.chkpt_seed || "") + '</textarea>', "What get_chkpt returns before the script sets anything. Values must be strings.");
+        '<button class="btn small" data-action="presetOkta">Okta preset</button> <button class="btn small" data-action="presetDarktrace">Darktrace preset</button>');
+      h += field("Checkpoint starting values (optional JSON)", '<textarea data-k="chkpt_seed" spellcheck="false" placeholder="{&quot;initial_since&quot;: &quot;2026-11-01T00:00:00Z&quot;}" style="min-height:44px">' + esc(s.chkpt_seed || "") + '</textarea>', "What get_chkpt returns before the script sets anything. Values must be strings. {now_ms-2h} expands to epoch milliseconds two hours ago (units s, m, h, d), handy for testing catch-up.");
       h += field("Config JSON (optional)", '<textarea data-k="config" spellcheck="false" placeholder="{}" style="min-height:60px">' + esc(s.config || "") + '</textarea>', "Passed to start(config), for example config[\"domain\"].");
       h += '<div class="insp-actions" style="margin:12px 0 4px"><button class="btn small primary" data-action="runCollector">Run collector</button> ' + clearBtn("clearSource") + '</div>';
       h += '<div class="hint">After a run, the emitted events become this pipeline source: press Generate on the serializer step to build the OCSF Lua from them.</div>';
@@ -1270,6 +1275,22 @@ document.addEventListener("click", async (ev) => {
     m.auth = "host"; m.paging = "link"; m.page_size = m.page_size || "2"; m.link_last = "omit"; m.header_case = "lower"; m.shape = "array";
     last = null; renderAll();
     banner("ok", "Okta preset applied: host-injected auth, Link header paging, checkpoint keys next_url and initial_since, sample config. Paste your collector and add events in the mock records.");
+  }
+  else if(a === "presetDarktrace"){
+    const sx = pipe.source;
+    sx.chkpt_keys = "LAST_END_TIME_MODELBREACHES, LAST_END_TIME_GROUPS, LAST_END_TIME_INCIDENTS, LAST_END_TIME_STATUS";
+    sx.chkpt_seed = JSON.stringify({LAST_END_TIME_MODELBREACHES: "{now_ms-2h}"});
+    sx.config = JSON.stringify({DARKTRACE_HOST: "https://darktrace.example.com", DARKTRACE_PUBLIC_TOKEN: "pub_test", DARKTRACE_PRIVATE_TOKEN: "priv_test",
+      FETCH_MODELBREACHES: true, FETCH_GROUPS: true, FETCH_INCIDENTS: true, FETCH_STATUS: true, MAX_PAGE_CALLS: 5}, null, 2);
+    const m = sx.mock || (sx.mock = {});
+    m.auth = "darktrace"; m.public_token = "pub_test"; m.private_token = "priv_test"; m.paging = "none"; m.shape = "array";
+    m.window_mode = "spread"; m.time_field = "time";
+    m.records = [1, 2, 3].map((i) => JSON.stringify({pbid: 1000 + i, time: 0, model: {then: {name: "Anomalous Connection / Rare External SSL", pid: 500 + i}}, score: 0.4 + i / 10, device: {did: i, hostname: "host-" + i}})).join("\n");
+    m.routes = JSON.stringify({"/aianalyst/groups": [{id: "g1", time: 0, title: "Unusual Activity", groupScore: 55}],
+      "/aianalyst/incidentevents": [{id: "i1", time: 0, title: "Possible C2", aiaScore: 71}],
+      "/status": {version: "6.1.0", time: 0, hostname: "darktrace-master"}});
+    last = null; renderAll();
+    banner("ok", "Darktrace preset applied: self-signed HMAC auth (pub_test / priv_test), four endpoints, records spread across each time window, and the modelbreaches checkpoint set 2 hours back so the catch-up loop runs. Paste your collector and press Run.");
   }
   else if(a === "starterCollector"){ pipe.source.code = starterCollector(pipe.source.mock); last = null; renderAll(); }
   else if(a === "runCollector"){ await runCollectorUI(); }
